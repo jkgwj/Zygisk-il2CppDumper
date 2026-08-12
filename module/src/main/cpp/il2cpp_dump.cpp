@@ -3,6 +3,7 @@
 //
 
 #include "il2cpp_dump.h"
+#include "metadata_dump.h"
 #include <dlfcn.h>
 #include <cstdlib>
 #include <cstring>
@@ -426,4 +427,6 @@ void il2cpp_dump(const char *outDir) {
     }
     outStream.close();
     LOGI("dump done!");
+    MetadataDump::Dumper metadataDumper;
+    metadataDumper.run(outDir);
 }
