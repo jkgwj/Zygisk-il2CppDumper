@@ -50,14 +50,13 @@ private:
     static constexpr int kMaxVersion = 31;
     static constexpr int kAcceptScore = 45;
     static constexpr size_t kMaxDumpSize = 64u * 1024 * 1024;
+    static constexpr size_t kMinScanRegion = 10u * 1024 * 1024;
     static constexpr size_t kScanByteBudget = 0x60000000ULL;
     static constexpr uint64_t kScanMsBudget = 25000;
 
     void *handle_ = nullptr;
     int memFd_ = -1;
-    FILE *logFp_ = nullptr;
     std::string outDir_;
-    std::string logPath_;
     std::vector<StepLog> steps_;
     std::vector<Region> regions_;
     bool dumped_ = false;
@@ -80,11 +79,8 @@ private:
     void *apiImageName_ = nullptr;
 
     bool safeRead(uintptr_t addr, void *out, size_t n);
+    bool fullyReadable(uintptr_t addr, size_t n) const;
 
-    void flushLog(int level, const char *fmt, va_list ap);
-    void logInfo(const char *fmt, ...) __attribute__((format(printf, 2, 3)));
-    void logWarn(const char *fmt, ...) __attribute__((format(printf, 2, 3)));
-    void logErr(const char *fmt, ...) __attribute__((format(printf, 2, 3)));
     void logStep(int phase, int total, const char *method, MethodStatus st,
                  const char *fmt, ...) __attribute__((format(printf, 6, 7)));
 
@@ -99,6 +95,7 @@ private:
 
     int locateByMaps();
     int locateByDlsym();
+    int locateBySGlobalMetadata();
     int locateByMagicScan();
     int locateByCodeRecovery();
     void collectArchAddr(const void *code, size_t len, std::vector<uintptr_t> &out);
@@ -106,6 +103,7 @@ private:
     bool writeDump();
     bool writeFile(const std::string &path, const uint8_t *data, size_t n);
     int guessVersion();
+    void logWinnerBreakdown();
 };
 
 } // namespace MetadataDump

@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include "xdl.h"
 #include "log.h"
+#include "dump_log.h"
 #include "il2cpp-tabledefs.h"
 #include "il2cpp-class.h"
 
@@ -31,6 +32,7 @@ void init_il2cpp_api(void *handle) {
     n = (r (*) p)xdl_sym(handle, #n, nullptr); \
     if(!n) {                                   \
         LOGW("api not found %s", #n);          \
+        DumpLog::warn("api 未找到 %s", #n); \
     }                                          \
 }
 
@@ -323,7 +325,7 @@ std::string dump_type(const Il2CppType *type) {
     return outPut.str();
 }
 
-void il2cpp_api_init(void *handle) {
+bool il2cpp_api_init(void *handle) {
     LOGI("il2cpp_handle: %p", handle);
     init_il2cpp_api(handle);
     if (il2cpp_domain_get_assemblies) {
@@ -334,7 +336,7 @@ void il2cpp_api_init(void *handle) {
         LOGI("il2cpp_base: %" PRIx64"", il2cpp_base);
     } else {
         LOGE("Failed to initialize il2cpp api.");
-        return;
+        return false;
     }
     while (!il2cpp_is_vm_thread(nullptr)) {
         LOGI("Waiting for il2cpp_init...");
@@ -342,13 +344,18 @@ void il2cpp_api_init(void *handle) {
     }
     auto domain = il2cpp_domain_get();
     il2cpp_thread_attach(domain);
+    return true;
 }
 
 void il2cpp_dump(const char *outDir) {
+    DumpLog::init(std::string(outDir) + "/files/dump.log");
+    uint64_t tStart = DumpLog::now_ms();
     LOGI("dumping...");
     size_t size;
     auto domain = il2cpp_domain_get();
     auto assemblies = il2cpp_domain_get_assemblies(domain, &size);
+    DumpLog::info("======== .cs 转储开始 ========");
+    DumpLog::info("程序集数量: %zu", size);
     std::stringstream imageOutput;
     for (int i = 0; i < size; ++i) {
         auto image = il2cpp_assembly_get_image(assemblies[i]);
@@ -359,17 +366,25 @@ void il2cpp_dump(const char *outDir) {
         LOGI("Version greater than 2018.3");
         //使用il2cpp_image_get_class
         for (int i = 0; i < size; ++i) {
+            uint64_t tImg = DumpLog::now_ms();
             auto image = il2cpp_assembly_get_image(assemblies[i]);
+            const char *imageName = il2cpp_image_get_name(image);
             std::stringstream imageStr;
-            imageStr << "\n// Dll : " << il2cpp_image_get_name(image);
+            imageStr << "\n// Dll : " << imageName;
             auto classCount = il2cpp_image_get_class_count(image);
+            DumpLog::info("image %d/%zu: %s, 类数量 %zu", i, size, imageName, classCount);
             for (int j = 0; j < classCount; ++j) {
                 auto klass = il2cpp_image_get_class(image, j);
                 auto type = il2cpp_class_get_type(const_cast<Il2CppClass *>(klass));
                 //LOGD("type name : %s", il2cpp_type_get_name(type));
                 auto outPut = imageStr.str() + dump_type(type);
                 outPuts.push_back(outPut);
+                if ((j + 1) % 500 == 0) {
+                    DumpLog::info("  image %s 进度 %d/%zu 类", imageName, j + 1, classCount);
+                }
             }
+            DumpLog::info("image %s 完成, 耗时 %" PRIu64 "ms",
+                          imageName, DumpLog::now_ms() - tImg);
         }
     } else {
         LOGI("Version less than 2018.3");
@@ -393,6 +408,7 @@ void il2cpp_dump(const char *outDir) {
         typedef void *(*Assembly_Load_ftn)(void *, Il2CppString *, void *);
         typedef Il2CppArray *(*Assembly_GetTypes_ftn)(void *, void *);
         for (int i = 0; i < size; ++i) {
+            uint64_t tImg = DumpLog::now_ms();
             auto image = il2cpp_assembly_get_image(assemblies[i]);
             std::stringstream imageStr;
             auto image_name = il2cpp_image_get_name(image);
@@ -408,16 +424,25 @@ void il2cpp_dump(const char *outDir) {
             auto reflectionTypes = ((Assembly_GetTypes_ftn) assemblyGetTypes->methodPointer)(
                     reflectionAssembly, nullptr);
             auto items = reflectionTypes->vector;
+            DumpLog::info("image %d/%zu: %s, 类数量 %zu", i, size, image_name,
+                          (size_t) reflectionTypes->max_length);
             for (int j = 0; j < reflectionTypes->max_length; ++j) {
                 auto klass = il2cpp_class_from_system_type((Il2CppReflectionType *) items[j]);
                 auto type = il2cpp_class_get_type(klass);
                 //LOGD("type name : %s", il2cpp_type_get_name(type));
                 auto outPut = imageStr.str() + dump_type(type);
                 outPuts.push_back(outPut);
+                if ((j + 1) % 500 == 0) {
+                    DumpLog::info("  image %s 进度 %d/%zu 类", image_name, j + 1,
+                                  (size_t) reflectionTypes->max_length);
+                }
             }
+            DumpLog::info("image %s 完成, 耗时 %" PRIu64 "ms", image_name,
+                          DumpLog::now_ms() - tImg);
         }
     }
-    LOGI("write dump file");
+    uint64_t tWrite = DumpLog::now_ms();
+    DumpLog::info("写 dump.cs ...");
     auto outPath = std::string(outDir).append("/files/dump.cs");
     std::ofstream outStream(outPath);
     outStream << imageOutput.str();
@@ -425,8 +450,11 @@ void il2cpp_dump(const char *outDir) {
     for (int i = 0; i < count; ++i) {
         outStream << outPuts[i];
     }
+    auto csBytes = (long long) outStream.tellp();
     outStream.close();
+    DumpLog::info("dump.cs 已写出: %zu 个类型, %lld 字节, 耗时 %" PRIu64 "ms",
+                  count, csBytes, DumpLog::now_ms() - tWrite);
     LOGI("dump done!");
-    MetadataDump::Dumper metadataDumper;
-    metadataDumper.run(outDir);
+    DumpLog::info("======== .cs 转储完成(%" PRIu64 "ms) ========",
+                  DumpLog::now_ms() - tStart);
 }

@@ -4,7 +4,10 @@
 
 #include "hack.h"
 #include "il2cpp_dump.h"
+#include "metadata_dump.h"
+#include "so_dump.h"
 #include "log.h"
+#include "dump_log.h"
 #include "xdl.h"
 #include <cstring>
 #include <cstdio>
@@ -18,21 +21,31 @@
 #include <array>
 
 void hack_start(const char *game_data_dir) {
+    DumpLog::init(std::string(game_data_dir) + "/files/dump.log");
     bool load = false;
+    void *handle = nullptr;
     for (int i = 0; i < 10; i++) {
-        void *handle = xdl_open("libil2cpp.so", 0);
+        handle = xdl_open("libil2cpp.so", 0);
         if (handle) {
-            load = true;
-            il2cpp_api_init(handle);
-            il2cpp_dump(game_data_dir);
-            break;
-        } else {
-            sleep(1);
+            // 符号可能因游戏分阶段加载/壳处理而暂时缺失，失败则重试
+            if (il2cpp_api_init(handle)) {
+                load = true;
+                break;
+            }
+            LOGI("il2cpp api 初始化失败, 重试 %d/10", i + 1);
         }
+        sleep(1);
     }
-    if (!load) {
-        LOGI("libil2cpp.so not found in thread %d", gettid());
+    if (load) {
+        il2cpp_dump(game_data_dir);
+    } else {
+        LOGI("libil2cpp.so not found or init failed in thread %d", gettid());
     }
+    // metadata 导出独立于 .cs 转储：无论 .cs 是否成功都单独尝试
+    MetadataDump::Dumper metadataDumper;
+    metadataDumper.run(game_data_dir);
+    // libil2cpp.so 导出独立，顺序在 metadata 之后
+    SoDump::dump(game_data_dir);
 }
 
 std::string GetLibDir(JavaVM *vms) {

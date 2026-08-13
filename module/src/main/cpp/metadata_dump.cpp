@@ -9,8 +9,11 @@
 #include <climits>
 #include <algorithm>
 #include <string>
+#include <setjmp.h>
+#include <signal.h>
+#include <elf.h>
 
-#include "log.h"
+#include "dump_log.h"
 #include "xdl.h"
 
 namespace MetadataDump {
@@ -23,15 +26,84 @@ uint64_t nowMs() {
     return (uint64_t) ts.tv_sec * 1000u + (uint64_t) (ts.tv_nsec / 1000000);
 }
 
+// 私有字节拷贝：不经过可能被反作弊 inline-hook 的 libc memcpy 符号。
+// noinline + volatile 防止编译器把循环优化回 memcpy 调用。
+__attribute__((noinline))
+static void copyBytes(void *dst, const void *src, size_t n) {
+    volatile uint8_t *d = (volatile uint8_t *) dst;
+    const volatile uint8_t *s = (const volatile uint8_t *) src;
+    for (size_t i = 0; i < n; ++i) d[i] = s[i];
+}
+
+// SIGSEGV/SIGBUS 兜底：读取可能已失效/受保护的内存时捕获 fault，避免崩溃。
+// 仅当「本线程正处于 guardedCopy 内」时才 siglongjmp 回本线程的 sigsetjmp 点，
+// 其余情况转发给原 handler（保证不影响游戏自身的信号处理）。
+thread_local sigjmp_buf g_crash_jmp;
+thread_local volatile sig_atomic_t g_crash_guard = 0;
+struct sigaction g_old_segv{};
+struct sigaction g_old_bus{};
+bool g_crash_installed = false;
+
+void crashHandler(int sig, siginfo_t *si, void *uc) {
+    if (g_crash_guard) {
+        siglongjmp(g_crash_jmp, 1);
+    }
+    struct sigaction *old = (sig == SIGSEGV) ? &g_old_segv : &g_old_bus;
+    if (old->sa_flags & SA_SIGINFO) {
+        if (old->sa_sigaction) old->sa_sigaction(sig, si, uc);
+    } else if (old->sa_handler && old->sa_handler != SIG_DFL && old->sa_handler != SIG_IGN) {
+        old->sa_handler(sig);
+    } else {
+        signal(sig, SIG_DFL);
+        raise(sig);
+    }
+}
+
+bool installCrashGuard() {
+    struct sigaction act{};
+    memset(&act, 0, sizeof(act));
+    act.sa_sigaction = crashHandler;
+    act.sa_flags = SA_SIGINFO | SA_NODEFER;
+    sigemptyset(&act.sa_mask);
+    if (sigaction(SIGSEGV, &act, &g_old_segv) != 0) return false;
+    if (sigaction(SIGBUS, &act, &g_old_bus) != 0) {
+        sigaction(SIGSEGV, &g_old_segv, nullptr);
+        return false;
+    }
+    g_crash_installed = true;
+    return true;
+}
+
+void uninstallCrashGuard() {
+    if (!g_crash_installed) return;
+    sigaction(SIGSEGV, &g_old_segv, nullptr);
+    sigaction(SIGBUS, &g_old_bus, nullptr);
+    g_crash_installed = false;
+}
+
+// 作用域守卫：进入时装 handler，离开作用域（含所有提前 return）时恢复。
+struct CrashGuardScope {
+    CrashGuardScope() { installCrashGuard(); }
+    ~CrashGuardScope() { uninstallCrashGuard(); }
+};
+
+__attribute__((noinline))
+bool guardedCopy(void *dst, const void *src, size_t n) {
+    g_crash_guard = 1;
+    if (sigsetjmp(g_crash_jmp, 1) == 0) {
+        copyBytes(dst, src, n);
+        g_crash_guard = 0;
+        return true;
+    }
+    g_crash_guard = 0;
+    return false;
+}
+
 }
 
 Dumper::Dumper() = default;
 
 Dumper::~Dumper() {
-    if (logFp_) {
-        fclose(logFp_);
-        logFp_ = nullptr;
-    }
     if (memFd_ >= 0) {
         close(memFd_);
         memFd_ = -1;
@@ -40,51 +112,22 @@ Dumper::~Dumper() {
 
 bool Dumper::safeRead(uintptr_t addr, void *out, size_t n) {
     if (n == 0) return true;
+    // 主路径：整段落在可读区间内则私有直接拷贝（零系统调用）
+    if (fullyReadable(addr, n)) {
+        if (guardedCopy(out, (const void *) addr, n)) return true;
+        // guardedCopy 触发 fault（读取已失效/受保护内存），继续尝试 /proc/self/mem
+    }
+    // 备用路径：/proc/self/mem pread（内核读，坏地址返回 EIO 而非崩溃）
     if (memFd_ >= 0) {
-        const size_t CHUNK = 1u << 20;
         size_t done = 0;
         while (done < n) {
-            size_t want = n - done < CHUNK ? n - done : CHUNK;
-            ssize_t r = pread(memFd_, (char *) out + done, want, (off_t) (addr + done));
+            ssize_t r = pread(memFd_, (char *) out + done, n - done, (off_t) (addr + done));
             if (r <= 0) return false;
             done += (size_t) r;
         }
         return true;
     }
-    memcpy(out, (const void *) addr, n);
-    return true;
-}
-
-void Dumper::flushLog(int level, const char *fmt, va_list ap) {
-    char buf[2048];
-    vsnprintf(buf, sizeof(buf), fmt, ap);
-    if (logFp_) {
-        fprintf(logFp_, "[%s] %s\n", level == ANDROID_LOG_ERROR ? "错误" :
-                                     level == ANDROID_LOG_WARN ? "警告" : "信息", buf);
-        fflush(logFp_);
-    }
-    __android_log_print(level, "MetadataDump", "%s", buf);
-}
-
-void Dumper::logInfo(const char *fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    flushLog(ANDROID_LOG_INFO, fmt, ap);
-    va_end(ap);
-}
-
-void Dumper::logWarn(const char *fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    flushLog(ANDROID_LOG_WARN, fmt, ap);
-    va_end(ap);
-}
-
-void Dumper::logErr(const char *fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    flushLog(ANDROID_LOG_ERROR, fmt, ap);
-    va_end(ap);
+    return false;
 }
 
 void Dumper::logStep(int phase, int total, const char *method, MethodStatus st,
@@ -105,7 +148,7 @@ void Dumper::logStep(int phase, int total, const char *method, MethodStatus st,
     const char *statusName = st == MethodStatus::OK ? "成功" :
                              st == MethodStatus::WARN ? "警告" :
                              st == MethodStatus::FAIL ? "失败" : "跳过";
-    logInfo("步骤 %d/%d [%s] -> %s 原因/说明: %s", phase, total, method, statusName,
+    DumpLog::info("步骤 %d/%d [%s] -> %s 原因/说明: %s", phase, total, method, statusName,
             reason);
     steps_.push_back(std::move(sl));
 }
@@ -114,7 +157,7 @@ bool Dumper::loadRegions() {
     regions_.clear();
     FILE *fp = fopen("/proc/self/maps", "r");
     if (!fp) {
-        logErr("无法打开 /proc/self/maps: %s", strerror(errno));
+        DumpLog::error("无法打开 /proc/self/maps: %s", strerror(errno));
         return false;
     }
     char line[1024];
@@ -151,20 +194,51 @@ bool Dumper::loadRegions() {
         regions_.push_back(std::move(r));
     }
     fclose(fp);
-    logInfo("/proc/self/maps 解析完成, 共 %zu 个区间", regions_.size());
+    size_t readable = 0;
+    for (const auto &r : regions_) {
+        if (r.perms.find('r') != std::string::npos) ++readable;
+    }
+    DumpLog::info("/proc/self/maps 解析完成: 总区间 %zu, 可读 %zu", regions_.size(), readable);
+    for (const auto &r : regions_) {
+        if (r.path.find("libil2cpp") != std::string::npos ||
+            r.path.find("global-metadata") != std::string::npos) {
+            DumpLog::info("  关键区间 [0x%" PRIxPTR "-0x%" PRIxPTR "] %s %s",
+                          r.start, r.end, r.perms.c_str(), r.path.c_str());
+        }
+    }
     return !regions_.empty();
 }
 
 const Region *Dumper::regionAt(uintptr_t addr) const {
-    for (const auto &r : regions_) {
-        if (addr >= r.start && addr < r.end) return &r;
+    // regions_ 由 /proc/self/maps 解析而来，按 start 升序、互不重叠
+    size_t lo = 0, hi = regions_.size();
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (regions_[mid].end <= addr) lo = mid + 1;
+        else hi = mid;
     }
+    if (lo < regions_.size() && regions_[lo].start <= addr && addr < regions_[lo].end)
+        return &regions_[lo];
     return nullptr;
 }
 
 uintptr_t Dumper::regionEndAt(uintptr_t addr) const {
     const Region *r = regionAt(addr);
     return r ? r->end : 0;
+}
+
+bool Dumper::fullyReadable(uintptr_t addr, size_t n) const {
+    uintptr_t cur = addr;
+    size_t remaining = n;
+    while (remaining > 0) {
+        const Region *r = regionAt(cur);
+        if (!r || r->perms.find('r') == std::string::npos) return false;
+        size_t can = (size_t) (r->end - cur);
+        if (can > remaining) can = remaining;
+        cur += can;
+        remaining -= can;
+    }
+    return true;
 }
 
 void Dumper::loadPairs(uintptr_t base, int32_t *out, size_t maxPairs) {
@@ -255,6 +329,7 @@ int Dumper::locateByMaps() {
         std::string name = (pos == std::string::npos) ? r.path : r.path.substr(pos + 1);
         if (name != "global-metadata.dat") continue;
         int s = scoreCandidate(r.start);
+        DumpLog::debug("maps 候选 %s [0x%" PRIxPTR "] 评分 %d", r.path.c_str(), r.start, s);
         if (s > best) {
             best = s;
             base_ = r.start;
@@ -272,7 +347,7 @@ int Dumper::locateByDlsym() {
         void *addr = xdl_sym(handle_, name, nullptr);
         if (!addr) addr = xdl_dsym(handle_, name, nullptr);
         if (!addr) {
-            logWarn("符号 %s 未找到 (dynsym/symtab 均无)", name);
+            DumpLog::warn("符号 %s 未找到 (dynsym/symtab 均无)", name);
             continue;
         }
         uintptr_t base = 0;
@@ -284,11 +359,11 @@ int Dumper::locateByDlsym() {
             base = v;
         }
         if (!base) {
-            logWarn("符号 %s 存在但其值为空", name);
+            DumpLog::warn("符号 %s 存在但其值为空", name);
             continue;
         }
         int s = scoreCandidate(base);
-        logInfo("符号 %s = %" PRIxPTR " 评分 %d", name, base, s);
+        DumpLog::info("符号 %s = %" PRIxPTR " 评分 %d", name, base, s);
         if (s > best) {
             best = s;
             base_ = base;
@@ -299,11 +374,62 @@ int Dumper::locateByDlsym() {
     return best;
 }
 
+int Dumper::locateBySGlobalMetadata() {
+    xdl_info_t info{};
+    if (xdl_info(handle_, XDL_DI_DLINFO, &info) != 0 || !info.dli_fbase || !info.dlpi_phdr ||
+        info.dlpi_phnum == 0) {
+        DumpLog::warn("xdl_info 无法取得 libil2cpp.so 的基址/程序头");
+        return 0;
+    }
+    int best = 0;
+    uintptr_t base = (uintptr_t) info.dli_fbase;
+    for (size_t i = 0; i < info.dlpi_phnum; ++i) {
+        const ElfW(Phdr) &ph = info.dlpi_phdr[i];
+        if (ph.p_type != PT_LOAD || !(ph.p_flags & PF_W)) continue;
+        uintptr_t segStart = base + ph.p_vaddr;
+        uintptr_t segEnd = segStart + ph.p_memsz;
+        if (segEnd <= segStart) continue;
+        DumpLog::info("s_GlobalMetadata 扫描 RW 段 [0x%" PRIxPTR "-0x%" PRIxPTR "] 大小 %zu",
+                      segStart, segEnd, (size_t) ph.p_memsz);
+        const size_t CHUNK = 1u << 20;
+        std::vector<uint8_t> buf(CHUNK, 0);
+        for (uintptr_t off = 0; off < ph.p_memsz; off += CHUNK) {
+            size_t want = (size_t) (ph.p_memsz - off < CHUNK ? ph.p_memsz - off : CHUNK);
+            if (!safeRead(segStart + off, buf.data(), want)) break;
+            for (size_t j = 0; j + 8 <= want; j += 8) {
+                uintptr_t candidate = 0;
+                memcpy(&candidate, buf.data() + j, 8);
+                if (candidate < 0x1000 || candidate == (uintptr_t) -1) continue;
+                uint32_t magic = 0;
+                int32_t version = 0;
+                if (!safeRead(candidate, &magic, 4)) continue;
+                if (magic != kMagic) continue;
+                if (!safeRead(candidate + 4, &version, 4)) continue;
+                if (version < kMinVersion || version > kMaxVersion) continue;
+                int s = scoreCandidate(candidate);
+                DumpLog::info("s_GlobalMetadata 命中: 指针 0x%" PRIxPTR " -> magic @0x%" PRIxPTR " 评分 %d",
+                              segStart + off + j, candidate, s);
+                if (s > best) {
+                    best = s;
+                    base_ = candidate;
+                    sourceMethod_ = "s_global_metadata";
+                    sourceDetail_ = "libil2cpp.so RW 段指针";
+                }
+                if (best >= kAcceptScore) return best;
+            }
+        }
+    }
+    return best;
+}
+
 int Dumper::locateByMagicScan() {
     int best = 0;
+    loadRegions();
     size_t scanned = 0;
     uint64_t started = nowMs();
+    size_t regionIdx = 0;
     for (const auto &r : regions_) {
+        ++regionIdx;
         if (best >= kAcceptScore && scanned > 0x1000000ULL) break;
         if (r.perms.find('r') == std::string::npos) continue;
         bool isAnon = r.path.empty();
@@ -318,7 +444,12 @@ int Dumper::locateByMagicScan() {
                        r.path.substr(r.path.size() - 4) == ".apk"));
         if (!isAnon && !isMeta) continue;
         if (isBad) continue;
+        if ((size_t) (r.end - r.start) < kMinScanRegion) continue;
 
+        size_t hits = 0;
+        DumpLog::info("magic_scan 扫描区间 #%zu [0x%" PRIxPTR "-0x%" PRIxPTR "] %s %s, 大小 %zu",
+                      regionIdx, r.start, r.end, r.perms.c_str(),
+                      r.path.empty() ? "(匿名)" : r.path.c_str(), (size_t) (r.end - r.start));
         size_t len = r.end - r.start;
         size_t chunkSize = 1u << 20;
         std::vector<uint8_t> buf(chunkSize, 0);
@@ -332,6 +463,11 @@ int Dumper::locateByMagicScan() {
                 auto checkHit = [&](size_t hitOff) {
                     uintptr_t hit = r.start + hitOff;
                     int s = scoreCandidate(hit);
+                    if (hits < 20) {
+                        DumpLog::info("magic_scan 命中候选 @0x%" PRIxPTR " (偏移+0x%zx) 评分 %d",
+                                      hit, hitOff, s);
+                    }
+                    ++hits;
                     if (s > best) {
                         best = s;
                         base_ = hit;
@@ -369,6 +505,7 @@ int Dumper::locateByMagicScan() {
             done += want;
             if (want < chunkSize) break;
         }
+        DumpLog::info("magic_scan 区间 #%zu 完成: 命中 %zu, 当前最高分 %d", regionIdx, hits, best);
     }
     return best;
 }
@@ -458,22 +595,22 @@ int Dumper::locateByCodeRecovery() {
     for (auto &fn : fns) {
         *(fn.ptr) = xdl_sym(handle_, fn.name, nullptr);
         if (!*(fn.ptr)) {
-            logWarn("导出符号 %s 不存在, 跳过该扫描点", fn.name);
+            DumpLog::warn("导出符号 %s 不存在, 跳过该扫描点", fn.name);
             continue;
         }
         const Region *reg = regionAt((uintptr_t) * (fn.ptr));
         if (reg && reg->perms.find('r') == std::string::npos) {
-            logWarn("导出符号 %s 所在区间不可读, 无法扫描其代码", fn.name);
+            DumpLog::warn("导出符号 %s 所在区间不可读, 无法扫描其代码", fn.name);
             continue;
         }
         std::vector<uintptr_t> addrs;
         collectArchAddr(*(fn.ptr), 0x80, addrs);
         if (addrs.empty()) {
-            logWarn("导出符号 %s 前 0x80 字节未发现数据地址模式", fn.name);
+            DumpLog::warn("导出符号 %s 前 0x80 字节未发现数据地址模式", fn.name);
             continue;
         }
         scanFunctions_.push_back(fn.name);
-        logInfo("导出符号 %s 中解析出 %zu 个数据地址候选", fn.name, addrs.size());
+        DumpLog::info("导出符号 %s 中解析出 %zu 个数据地址候选", fn.name, addrs.size());
         for (uintptr_t a : addrs) {
             candidates_.push_back(a);
             int s = 0;
@@ -495,10 +632,10 @@ size_t Dumper::deriveSize() {
         if (regionEnd > base_) {
             metaSize_ = regionEnd - base_;
             if (metaSize_ > kMaxDumpSize) {
-                logWarn("映射区间过大(%zu 字节), 截断到 %zu 字节", metaSize_, kMaxDumpSize);
+                DumpLog::warn("映射区间过大(%zu 字节), 截断到 %zu 字节", metaSize_, kMaxDumpSize);
                 metaSize_ = kMaxDumpSize;
             }
-            logInfo("大小来源: named-map 区间长度 %zu 字节", metaSize_);
+            DumpLog::info("大小来源: named-map 区间长度 %zu 字节", metaSize_);
             return metaSize_;
         }
     }
@@ -520,12 +657,12 @@ size_t Dumper::deriveSize() {
     size_t cand = maxEnd + 0x1000;
     if (regionLen && regionLen >= cand && regionLen <= kMaxDumpSize) {
         cand = regionLen;
-        logInfo("大小来源: 专用匿名区(区间即文件) %zu 字节", regionLen);
+        DumpLog::info("大小来源: 专用匿名区(区间即文件) %zu 字节", regionLen);
     } else {
-        logInfo("大小来源: 表推算 maxEnd %zu, 若被截断以区间上限为界", maxEnd);
+        DumpLog::info("大小来源: 表推算 maxEnd %zu, 若被截断以区间上限为界", maxEnd);
     }
     if (regionLen && cand > regionLen) {
-        logWarn("推算大小 %zu 超过所在区间 %zu, 已截断, 存在截断风险", cand, regionLen);
+        DumpLog::warn("推算大小 %zu 超过所在区间 %zu, 已截断, 存在截断风险", cand, regionLen);
         cand = regionLen;
     }
     if (cand == 0 || cand > kMaxDumpSize) cand = kMaxDumpSize;
@@ -544,10 +681,29 @@ int Dumper::guessVersion() {
     return 29;
 }
 
+void Dumper::logWinnerBreakdown() {
+    uint32_t sanity = 0;
+    int32_t version = 0;
+    safeRead(base_, &sanity, 4);
+    safeRead(base_ + 4, &version, 4);
+    int32_t pairs[68];
+    loadPairs(base_, pairs, 68);
+    uintptr_t regionEnd = regionEndAt(base_);
+    size_t limit = regionEnd ? regionEnd - base_ : kMaxDumpSize * 2;
+    int good = 0;
+    for (int k = 0; k + 1 < 68; k += 2) {
+        int32_t off = pairs[k], sz = pairs[k + 1];
+        if (off > 0 && sz > 0 && (size_t) off + (size_t) sz <= limit) ++good;
+    }
+    DumpLog::info("胜者明细: sanity=0x%08" PRIx32 " version=%d 有效表对=%d/34 "
+                  "stringOffset=%d imagesOffset=%d assembliesOffset=%d",
+                  sanity, version, good, pairs[4], pairs[42], pairs[44]);
+}
+
 bool Dumper::writeFile(const std::string &path, const uint8_t *data, size_t n) {
     int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {
-        logErr("打开输出文件失败 %s: %s", path.c_str(), strerror(errno));
+        DumpLog::error("打开输出文件失败 %s: %s", path.c_str(), strerror(errno));
         return false;
     }
     size_t done = 0;
@@ -555,37 +711,43 @@ bool Dumper::writeFile(const std::string &path, const uint8_t *data, size_t n) {
         ssize_t w = write(fd, data + done, n - done);
         if (w <= 0) {
             if (errno == EINTR) continue;
-            logErr("写入失败 %s @%zu: %s", path.c_str(), done, strerror(errno));
+            DumpLog::error("写入失败 %s @%zu: %s", path.c_str(), done, strerror(errno));
             close(fd);
             return false;
         }
         done += (size_t) w;
     }
     close(fd);
-    logInfo("已写出 %zu 字节到 %s", n, path.c_str());
+    DumpLog::info("已写出 %zu 字节到 %s", n, path.c_str());
     return true;
 }
 
 bool Dumper::writeDump() {
+    loadRegions();
     std::vector<uint8_t> data;
     data.resize(metaSize_);
     const size_t CHUNK = 1u << 20;
     size_t filled = 0;
+    size_t nextLog = 8u << 20;
     while (filled < metaSize_) {
         size_t want = metaSize_ - filled < CHUNK ? metaSize_ - filled : CHUNK;
         if (!safeRead(base_ + filled, data.data() + filled, want)) {
-            logWarn("读取内存 metadata 中断 @%" PRIxPTR " +%zu, 仅保留已读部分",
+            DumpLog::warn("读取内存 metadata 中断 @%" PRIxPTR " +%zu, 仅保留已读部分",
                     base_ + filled, want);
             break;
         }
         filled += want;
+        if (filled >= nextLog) {
+            DumpLog::info("转储进度 %zu/%zu 字节", filled, metaSize_);
+            nextLog += 8u << 20;
+        }
     }
     if (filled == 0) {
-        logErr("未能读取到任何 metadata 字节");
+        DumpLog::error("未能读取到任何 metadata 字节");
         return false;
     }
     if (filled < metaSize_) {
-        logWarn("实际读取 %zu 字节, 小于预估大小 %zu", filled, metaSize_);
+        DumpLog::warn("实际读取 %zu 字节, 小于预估大小 %zu", filled, metaSize_);
         data.resize(filled);
         metaSize_ = filled;
     }
@@ -599,14 +761,14 @@ bool Dumper::writeDump() {
     int32_t writtenVersion = version;
     if (sanity != kMagic) {
         sanityMangled_ = true;
-        logWarn("内存中 sanity 魔数异常(0x%08" PRIx32 "), 将回写为 0xFAB11BAF", sanity);
+        DumpLog::warn("内存中 sanity 魔数异常(0x%08" PRIx32 "), 将回写为 0xFAB11BAF", sanity);
         uint32_t m = kMagic;
         memcpy(data.data(), &m, 4);
     }
     if (version < kMinVersion || version > kMaxVersion) {
         versionMangled_ = true;
         metaVersion_ = guessVersion();
-        logWarn("内存中 version 异常(%d), 猜测为 %d, 将同时输出各候选版本文件", version,
+        DumpLog::warn("内存中 version 异常(%d), 猜测为 %d, 将同时输出各候选版本文件", version,
                 metaVersion_);
         int32_t gv = metaVersion_;
         memcpy(data.data() + 4, &gv, 4);
@@ -622,9 +784,9 @@ bool Dumper::writeDump() {
     } else {
         metaVersion_ = version;
         writtenVersion = version;
-        logInfo("version 字段正常 (%d), 主文件按原值输出", version);
+        DumpLog::info("version 字段正常 (%d), 主文件按原值输出", version);
     }
-    logInfo("主文件 version 写为 %d", writtenVersion);
+    DumpLog::info("主文件 version 写为 %d", writtenVersion);
     if (!writeFile(outPath, data.data(), data.size())) {
         return false;
     }
@@ -634,17 +796,18 @@ bool Dumper::writeDump() {
 bool Dumper::run(const char *outDir) {
     if (!outDir) return false;
     outDir_ = outDir;
-    logPath_ = outDir_ + "/files/dump_metadata.log";
-    logFp_ = fopen(logPath_.c_str(), "w");
+    DumpLog::init(outDir_ + "/files/dump.log");
+    CrashGuardScope crashGuard;  // 读内存 SIGSEGV 兜底，作用域结束自动恢复
     memFd_ = open("/proc/self/mem", O_RDONLY);
     if (memFd_ < 0) {
-        logErr("打开 /proc/self/mem 失败: %s, 停用内存转储以避免崩溃", strerror(errno));
-        return false;
+        DumpLog::warn("打开 /proc/self/mem 失败(%s), 改用进程内直接读(主路径)", strerror(errno));
+    } else {
+        DumpLog::info("备用读后端 /proc/self/mem 可用(fd=%d)", memFd_);
     }
 
     uint64_t startAll = nowMs();
-    logInfo("======== 元数据内存转储开始 ========");
-    logInfo("进程 PID=%d, 架构="
+    DumpLog::info("======== 元数据内存转储开始 ========");
+    DumpLog::info("进程 PID=%d, 架构="
 #if defined(__aarch64__)
             "aarch64"
 #elif defined(__arm__)
@@ -655,18 +818,18 @@ bool Dumper::run(const char *outDir) {
             "x86"
 #endif
             ", 输出目录: %s", getpid(), outDir_.c_str());
-    logInfo("约定: magic=0x%08" PRIx32 " 版本区间=%d..%d", kMagic, kMinVersion, kMaxVersion);
+    DumpLog::info("约定: magic=0x%08" PRIx32 " 版本区间=%d..%d", kMagic, kMinVersion, kMaxVersion);
 
     handle_ = xdl_open("libil2cpp.so", 0);
     if (!handle_) {
-        logErr("xdl_open(libil2cpp.so) 失败, 无法继续");
-        logInfo("======== [结果] 元数据转储失败: 未加载 libil2cpp.so ========");
+        DumpLog::error("xdl_open(libil2cpp.so) 失败, 无法继续");
+        DumpLog::info("======== [结果] 元数据转储失败: 未加载 libil2cpp.so ========");
         return false;
     }
-    logInfo("libil2cpp.so 已打开(%p)", handle_);
+    DumpLog::info("libil2cpp.so 已打开(%p)", handle_);
 
     if (!loadRegions()) {
-        logErr("解析 /proc/self/maps 失败, 保留部分定位手段受限");
+        DumpLog::error("解析 /proc/self/maps 失败, 保留部分定位手段受限");
     }
 
     bool bestFound = false;
@@ -685,10 +848,10 @@ bool Dumper::run(const char *outDir) {
             bestMethod = "maps";
             bestDetail = sourceDetail_;
             bestFound = true;
-            logStep(1, 4, "locate_by_maps", MethodStatus::OK,
+            logStep(1, 5, "locate_by_maps", MethodStatus::OK,
                     "命中映射 %s, 评分 %d, 耗时 %" PRIu64 "ms", sourceDetail_.c_str(), s, el);
         } else {
-            logStep(1, 4, "locate_by_maps", MethodStatus::FAIL,
+            logStep(1, 5, "locate_by_maps", MethodStatus::FAIL,
                     "未找到名为 global-metadata.dat 的映射区间, 耗时 %" PRIu64 "ms", el);
         }
     }
@@ -703,37 +866,37 @@ bool Dumper::run(const char *outDir) {
             bestMethod = "dlsym";
             bestDetail = sourceDetail_;
             bestFound = true;
-            logStep(2, 4, "locate_by_dlsym", MethodStatus::OK,
+            logStep(2, 5, "locate_by_dlsym", MethodStatus::OK,
                     "符号 %s 解析出 base=%" PRIxPTR ", 评分 %d, 耗时 %" PRIu64 "ms",
                     sourceDetail_.c_str(), base_, s, el);
         } else {
-            logStep(2, 4, "locate_by_dlsym", MethodStatus::FAIL,
+            logStep(2, 5, "locate_by_dlsym", MethodStatus::FAIL,
                     "未通过符号 s_GlobalMetadata/s_GlobalMetadataHeader 找到有效 base, 耗时 %" PRIu64 "ms",
                     el);
         }
     } else {
-        logStep(2, 4, "locate_by_dlsym", MethodStatus::SKIPPED, "上一方法已命中并达到置信线");
+        logStep(2, 5, "locate_by_dlsym", MethodStatus::SKIPPED, "上一方法已命中并达到置信线");
     }
 
     if (!bestFound || bestScore < kAcceptScore) {
         uint64_t t0 = nowMs();
-        int s = locateByMagicScan();
+        int s = locateBySGlobalMetadata();
         uint64_t el = nowMs() - t0;
         if (s > bestScore) {
             bestScore = s;
             bestAddr = base_;
-            bestMethod = "magic_scan";
+            bestMethod = "s_global_metadata";
             bestDetail = sourceDetail_;
             bestFound = true;
-            logStep(3, 4, "locate_by_magic_scan", MethodStatus::OK,
-                    "命中 %s, base=%" PRIxPTR ", 评分 %d, 耗时 %" PRIu64 "ms",
-                    sourceDetail_.c_str(), base_, s, el);
+            logStep(3, 5, "locate_by_s_global_metadata", MethodStatus::OK,
+                    "RW 段指针命中 base=%" PRIxPTR ", 评分 %d, 耗时 %" PRIu64 "ms",
+                    base_, s, el);
         } else {
-            logStep(3, 4, "locate_by_magic_scan", MethodStatus::FAIL,
-                    "全内存未搜到可信 magic 候选(最高评分 %d), 耗时 %" PRIu64 "ms", s, el);
+            logStep(3, 5, "locate_by_s_global_metadata", MethodStatus::FAIL,
+                    "RW 段未找到指向 magic 的指针, 耗时 %" PRIu64 "ms", el);
         }
     } else {
-        logStep(3, 4, "locate_by_magic_scan", MethodStatus::SKIPPED, "上一方法已命中并达到置信线");
+        logStep(3, 5, "locate_by_s_global_metadata", MethodStatus::SKIPPED, "上一方法已命中并达到置信线");
     }
 
     if (!bestFound || bestScore < kAcceptScore) {
@@ -746,20 +909,41 @@ bool Dumper::run(const char *outDir) {
             bestMethod = "code_recovery";
             bestDetail = sourceDetail_;
             bestFound = true;
-            logStep(4, 4, "locate_by_code_recovery", MethodStatus::OK,
+            logStep(4, 5, "locate_by_code_recovery", MethodStatus::OK,
                     "经 %s 反推 base=%" PRIxPTR ", 评分 %d, 耗时 %" PRIu64 "ms",
                     sourceDetail_.c_str(), base_, s, el);
         } else {
-            logStep(4, 4, "locate_by_code_recovery", MethodStatus::FAIL,
+            logStep(4, 5, "locate_by_code_recovery", MethodStatus::FAIL,
                     "导出函数前 0x80 字节未反推出有效 base, 耗时 %" PRIu64 "ms", el);
         }
     } else {
-        logStep(4, 4, "locate_by_code_recovery", MethodStatus::SKIPPED, "上一方法已命中并达到置信线");
+        logStep(4, 5, "locate_by_code_recovery", MethodStatus::SKIPPED, "上一方法已命中并达到置信线");
+    }
+
+    if (!bestFound || bestScore < kAcceptScore) {
+        uint64_t t0 = nowMs();
+        int s = locateByMagicScan();
+        uint64_t el = nowMs() - t0;
+        if (s > bestScore) {
+            bestScore = s;
+            bestAddr = base_;
+            bestMethod = "magic_scan";
+            bestDetail = sourceDetail_;
+            bestFound = true;
+            logStep(5, 5, "locate_by_magic_scan", MethodStatus::OK,
+                    "命中 %s, base=%" PRIxPTR ", 评分 %d, 耗时 %" PRIu64 "ms",
+                    sourceDetail_.c_str(), base_, s, el);
+        } else {
+            logStep(5, 5, "locate_by_magic_scan", MethodStatus::FAIL,
+                    "全内存未搜到可信 magic 候选(最高评分 %d), 耗时 %" PRIu64 "ms", s, el);
+        }
+    } else {
+        logStep(5, 5, "locate_by_magic_scan", MethodStatus::SKIPPED, "上一方法已命中并达到置信线");
     }
 
     if (!bestFound) {
-        logErr("四种定位方法均失败, 无任何候选 base");
-        logInfo("======== [结果] 元数据转储失败: 未能定位内存中的 global-metadata ========");
+        DumpLog::error("五种定位方法均失败, 无任何候选 base");
+        DumpLog::info("======== [结果] 元数据转储失败: 未能定位内存中的 global-metadata ========");
         return false;
     }
 
@@ -767,27 +951,28 @@ bool Dumper::run(const char *outDir) {
     sourceMethod_ = bestMethod;
     sourceDetail_ = bestDetail;
     wellVerified_ = bestScore >= kAcceptScore;
-    logInfo("定位确认: base=%" PRIxPTR ", 最高评分=%d (%s), 方法=%s %s", base_, bestScore,
+    DumpLog::info("定位确认: base=%" PRIxPTR ", 最高评分=%d (%s), 方法=%s %s", base_, bestScore,
             wellVerified_ ? "高置信" : "低置信(降级WARN)",
             sourceMethod_.c_str(), sourceDetail_.c_str());
+    logWinnerBreakdown();
 
     if (wellVerified_) {
         int32_t v = 0;
         safeRead(base_ + 4, &v, 4);
-        logInfo("校验通过: sanity=%s version=%d",
+        DumpLog::info("校验通过: sanity=%s version=%d",
                 [&]() -> const char * {
                     uint32_t s;
                     safeRead(base_, &s, 4);
                     return s == kMagic ? "有效" : "异常(稍后回写)";
                 }(), v);
     } else {
-        logWarn("候选 base 未达置信线, 按兜底策略仍尝试转储(WARN)");
+        DumpLog::warn("候选 base 未达置信线, 按兜底策略仍尝试转储(WARN)");
     }
 
     deriveSize();
     if (metaSize_ == 0) {
-        logErr("无法确定大小, 放弃转储");
-        logInfo("======== [结果] 元数据转储失败: size 推算为 0 ========");
+        DumpLog::error("无法确定大小, 放弃转储");
+        DumpLog::info("======== [结果] 元数据转储失败: size 推算为 0 ========");
         return false;
     }
 
@@ -795,26 +980,26 @@ bool Dumper::run(const char *outDir) {
     int32_t ver0 = 0;
     safeRead(base_, &sanity0, 4);
     safeRead(base_ + 4, &ver0, 4);
-    logInfo("内存头部原始值: sanity=0x%08" PRIx32 ", version=%d", sanity0, ver0);
+    DumpLog::info("内存头部原始值: sanity=0x%08" PRIx32 ", version=%d", sanity0, ver0);
 
     if (!writeDump()) {
-        logErr("写盘失败, 请检查目录权限与磁盘空间");
-        logInfo("======== [结果] 元数据转储失败: 写盘阶段出错 ========");
+        DumpLog::error("写盘失败, 请检查目录权限与磁盘空间");
+        DumpLog::info("======== [结果] 元数据转储失败: 写盘阶段出错 ========");
         return false;
     }
 
     dumped_ = true;
     uint64_t totalElapsed = nowMs() - startAll;
-    logInfo("======== [结果] 元数据转储%s ========",
+    DumpLog::info("======== [结果] 元数据转储%s ========",
             wellVerified_ ? "成功" : "成功(低置信度, 内容可能需要离线校对)");
-    logInfo("产物清单:");
-    logInfo("  主文件: %s/files/global-metadata.dat (%zu 字节)", outDir_.c_str(), metaSize_);
-    logInfo("  日志文件: %s", logPath_.c_str());
+    DumpLog::info("产物清单:");
+    DumpLog::info("  主文件: %s/files/global-metadata.dat (%zu 字节)", outDir_.c_str(), metaSize_);
+    DumpLog::info("  日志文件: %s/files/dump.log", outDir_.c_str());
     if (versionMangled_) {
-        logWarn("因 version 被混淆, 已额外输出 24..31 各候选版本文件, 建议用 Il2CppDumper/Il2CppInspector 逐个验证");
+        DumpLog::warn("因 version 被混淆, 已额外输出 24..31 各候选版本文件, 建议用 Il2CppDumper/Il2CppInspector 逐个验证");
     }
-    logInfo("定位方法链: %s", sourceMethod_.c_str());
-    logInfo("耗时总计 %" PRIu64 "ms", totalElapsed);
+    DumpLog::info("定位方法链: %s", sourceMethod_.c_str());
+    DumpLog::info("耗时总计 %" PRIu64 "ms", totalElapsed);
     return true;
 }
 
