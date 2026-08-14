@@ -39,6 +39,8 @@ add_library(${MODULE_NAME} SHARED
         il2cpp_dump.cpp
         metadata_dump.cpp
         so_dump.cpp
+        hook_framework.cpp
+        key_hook.cpp
         ${xdl-src})
 target_link_libraries(${MODULE_NAME} log)
 

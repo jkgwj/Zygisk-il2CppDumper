@@ -8,6 +8,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <cinttypes>
+#include <csignal>
+#include <csetjmp>
 #include <string>
 #include <vector>
 #include <sstream>
@@ -30,6 +32,7 @@ static uint64_t il2cpp_base = 0;
 void init_il2cpp_api(void *handle) {
 #define DO_API(r, n, p) {                      \
     n = (r (*) p)xdl_sym(handle, #n, nullptr); \
+    if(!n) n = (r (*) p)xdl_dsym(handle, #n, nullptr); \
     if(!n) {                                   \
         LOGW("api not found %s", #n);          \
         DumpLog::warn("api 未找到 %s", #n); \
@@ -325,32 +328,171 @@ std::string dump_type(const Il2CppType *type) {
     return outPut.str();
 }
 
+static uint64_t api_base_of(void *handle) {
+    Dl_info dlInfo;
+    void *known[] = {(void *) il2cpp_class_for_each, (void *) il2cpp_class_get_name,
+                     (void *) il2cpp_field_get_name};
+    for (void *sym : known) {
+        if (sym && dladdr(sym, &dlInfo) && dlInfo.dli_fbase) {
+            return reinterpret_cast<uint64_t>(dlInfo.dli_fbase);
+        }
+    }
+    xdl_info_t info{};
+    if (xdl_info(handle, XDL_DI_DLINFO, &info) == 0 && info.dli_fbase) {
+        return (uint64_t) info.dli_fbase;
+    }
+    return 0;
+}
+
 bool il2cpp_api_init(void *handle) {
     LOGI("il2cpp_handle: %p", handle);
     init_il2cpp_api(handle);
-    if (il2cpp_domain_get_assemblies) {
-        Dl_info dlInfo;
-        if (dladdr((void *) il2cpp_domain_get_assemblies, &dlInfo)) {
-            il2cpp_base = reinterpret_cast<uint64_t>(dlInfo.dli_fbase);
-        }
-        LOGI("il2cpp_base: %" PRIx64"", il2cpp_base);
-    } else {
-        LOGE("Failed to initialize il2cpp api.");
+    // 基址优先用已解析的导出符号 dladdr 反推；domain_get_assemblies 缺失时
+    // 用 class_for_each 等（本包必导出）。不再因缺该符号而硬失败。
+    il2cpp_base = api_base_of(handle);
+    LOGI("il2cpp_base: %" PRIx64, il2cpp_base);
+    if (!il2cpp_base) {
+        LOGE("Failed to determine libil2cpp base.");
         return false;
     }
-    while (!il2cpp_is_vm_thread(nullptr)) {
-        LOGI("Waiting for il2cpp_init...");
-        sleep(1);
+    // 等运行时初始化完成；is_vm_thread 缺失时退化为 domain 非空（含 30s 超时防拖死 dump）
+    int waited = 0;
+    if (il2cpp_is_vm_thread) {
+        while (!il2cpp_is_vm_thread(nullptr)) {
+            if (++waited > 30) {
+                LOGE("等待 il2cpp 运行时就绪超时(30s)");
+                return false;
+            }
+            LOGI("Waiting for il2cpp_init... (%ds)", waited);
+            sleep(1);
+        }
     }
-    auto domain = il2cpp_domain_get();
-    il2cpp_thread_attach(domain);
+    auto domain = il2cpp_domain_get ? il2cpp_domain_get() : nullptr;
+    if (domain && il2cpp_thread_attach) {
+        il2cpp_thread_attach(domain);
+    }
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// 兜底转储（jkgbk）：部分 Endfield 包不导出 il2cpp_domain_get_assemblies，
+// 无法枚举程序集→类。改走 il2cpp_class_for_each（本包必导出）枚举运行时已
+// realize 的类，输出简化格式：namespace.类名头 + 方法名 RVA。只服务
+// "方法名→RVA" 检索，不还原完整签名。全程崩溃护栏，异常即中止写盘。
+// ---------------------------------------------------------------------------
+namespace {
+
+thread_local sigjmp_buf g_dump_jmp;
+thread_local volatile sig_atomic_t g_dump_guard = 0;
+struct sigaction g_dump_old_segv{};
+struct sigaction g_dump_old_bus{};
+
+void dump_crash_handler(int sig, siginfo_t *, void *) {
+    if (g_dump_guard) siglongjmp(g_dump_jmp, 1);
+    struct sigaction *old = (sig == SIGSEGV) ? &g_dump_old_segv : &g_dump_old_bus;
+    if (old->sa_flags & SA_SIGINFO) {
+        if (old->sa_sigaction) old->sa_sigaction(sig, nullptr, nullptr);
+    } else if (old->sa_handler && old->sa_handler != SIG_DFL && old->sa_handler != SIG_IGN) {
+        old->sa_handler(sig);
+    } else {
+        signal(sig, SIG_DFL);
+        raise(sig);
+    }
+}
+
+bool dump_install_guard() {
+    struct sigaction act{};
+    memset(&act, 0, sizeof(act));
+    act.sa_sigaction = dump_crash_handler;
+    act.sa_flags = SA_SIGINFO | SA_NODEFER;
+    sigemptyset(&act.sa_mask);
+    if (sigaction(SIGSEGV, &act, &g_dump_old_segv) != 0) return false;
+    if (sigaction(SIGBUS, &act, &g_dump_old_bus) != 0) {
+        sigaction(SIGSEGV, &g_dump_old_segv, nullptr);
+        return false;
+    }
+    return true;
+}
+
+void dump_uninstall_guard() {
+    sigaction(SIGSEGV, &g_dump_old_segv, nullptr);
+    sigaction(SIGBUS, &g_dump_old_bus, nullptr);
+}
+
+struct PartialCtx {
+    std::ofstream *fs;
+    long count;
+};
+
+void dump_partial_class(Il2CppClass *klass, void *userData) {
+    auto *ctx = (PartialCtx *) userData;
+    if (!ctx || !ctx->fs || !klass) return;
+    if ((++ctx->count % 5000) == 0) {
+        DumpLog::info("  兜底转储进度: %ld 类", ctx->count);
+    }
+    const char *ns = il2cpp_class_get_namespace ? il2cpp_class_get_namespace(klass) : nullptr;
+    const char *nm = il2cpp_class_get_name ? il2cpp_class_get_name(klass) : nullptr;
+    if (!nm) return;
+    *ctx->fs << "\n// ===== " << (ns ? ns : "") << "." << nm << " (realized) =====\n";
+    if (!il2cpp_class_get_methods || !il2cpp_method_get_name) return;
+    void *iter = nullptr;
+    const MethodInfo *mi;
+    while ((mi = il2cpp_class_get_methods(klass, &iter)) != nullptr) {
+        const char *mn = il2cpp_method_get_name(mi);
+        if (!mn) continue;
+        *ctx->fs << "  " << mn;
+        if (mi->methodPointer && il2cpp_base) {
+            *ctx->fs << " RVA 0x" << std::hex
+                     << ((uint64_t) mi->methodPointer - il2cpp_base) << std::dec;
+        }
+        *ctx->fs << "\n";
+    }
+}
+
+} // namespace
+
+static void il2cpp_dump_cs_fallback(const char *outDir) {
+    DumpLog::info("==== .cs 兜底转储开始 (class_for_each) ====");
+    if (!il2cpp_class_for_each) {
+        DumpLog::warn("il2cpp_class_for_each 也缺失, 无法 .cs 转储");
+        return;
+    }
+    auto outPath = std::string(outDir).append("/files/dump.cs");
+    std::ofstream outStream(outPath);
+    if (!outStream) {
+        DumpLog::warn("无法创建 dump.cs: %s", outPath.c_str());
+        return;
+    }
+    outStream << "// il2cpp_domain_get_assemblies 缺失, 本文件为 class_for_each 兜底转储\n";
+    outStream << "// 只含 dump 时刻已 realize 的类; 方法行格式: 方法名 RVA 0x...\n";
+
+    PartialCtx ctx{&outStream, 0};
+    bool guarded = dump_install_guard();
+    uint64_t tDump = DumpLog::now_ms();
+    if (guarded && sigsetjmp(g_dump_jmp, 1) == 0) {
+        il2cpp_class_for_each(dump_partial_class, &ctx);
+    } else {
+        DumpLog::warn("兜底枚举触发异常信号, 中止转储 (已写出部分类)");
+    }
+    if (guarded) dump_uninstall_guard();
+    outStream.close();
+    DumpLog::info("dump.cs 兜底已写出: %ld 个类型, 耗时 %" PRIu64 "ms",
+                  ctx.count, DumpLog::now_ms() - tDump);
+    DumpLog::info("==== .cs 兜底转储完成 ====");
 }
 
 void il2cpp_dump(const char *outDir) {
     DumpLog::init(std::string(outDir) + "/files/dump.log");
     uint64_t tStart = DumpLog::now_ms();
     LOGI("dumping...");
+    // 部分 Endfield 包不导出 il2cpp_domain_get_assemblies（NULL 指针），
+    // 绝不能无条件调用它——那是函数指针为空的调用，一调就 SIGSEGV 闪退。
+    // 缺失时改走 il2cpp_class_for_each 兜底转储。
+    if (!il2cpp_domain_get_assemblies || !il2cpp_domain_get) {
+        DumpLog::warn("il2cpp_domain_get_assemblies 缺失, 走 class_for_each 兜底转储");
+        il2cpp_dump_cs_fallback(outDir);
+        return;
+    }
     size_t size;
     auto domain = il2cpp_domain_get();
     auto assemblies = il2cpp_domain_get_assemblies(domain, &size);

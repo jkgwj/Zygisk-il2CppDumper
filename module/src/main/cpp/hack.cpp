@@ -8,6 +8,7 @@
 #include "so_dump.h"
 #include "log.h"
 #include "dump_log.h"
+#include "key_hook.h"
 #include "xdl.h"
 #include <cstring>
 #include <cstdio>
@@ -22,24 +23,37 @@
 
 void hack_start(const char *game_data_dir) {
     DumpLog::init(std::string(game_data_dir) + "/files/dump.log");
+
+    // .cs 转储依赖 il2cpp_domain_get_assemblies；init_il2cpp_api 已带 xdl_dsym
+    // (.symtab) 兜底。注意：部分 Endfield 包连 .symtab 都没有该符号，此时
+    // 等多久都不会出现——只试 kApiMaxTries 次就放行，不再拖住 metadata/so。
+    // 符号存在的游戏首次即命中，几乎不增加延迟。
+    constexpr int kApiMaxTries = 15;
     bool load = false;
     void *handle = nullptr;
-    for (int i = 0; i < 10; i++) {
+    for (int i = 1; i <= kApiMaxTries; i++) {
         handle = xdl_open("libil2cpp.so", 0);
         if (handle) {
-            // 符号可能因游戏分阶段加载/壳处理而暂时缺失，失败则重试
             if (il2cpp_api_init(handle)) {
                 load = true;
                 break;
             }
-            LOGI("il2cpp api 初始化失败, 重试 %d/10", i + 1);
+            LOGI("il2cpp api 尚未就绪(%d/%d), 重试", i, kApiMaxTries);
+        } else {
+            LOGI("libil2cpp.so 尚未加载(%d/%d), 重试", i, kApiMaxTries);
         }
         sleep(1);
     }
     if (load) {
         il2cpp_dump(game_data_dir);
+        // hook 安装时机与 dump.cs 同步（jkgbk）：
+        // 之前是独立线程"运行时就绪第一时间(约 1.6s)"就去全局扫类方法表反查 RVA，
+        // 正值运行时懒初始化期，并发遍历类型表把游戏直接带崩(一打开就闪退)。
+        // 密钥无需抢早期真实调用——有 call_once 手动调用兜底，故改在 dump.cs
+        // 跑完后、仍由 dump 线程装 hook；flush 走独立线程，不阻塞 metadata/so。
+        KeyHook::start_synced(game_data_dir);
     } else {
-        LOGI("libil2cpp.so not found or init failed in thread %d", gettid());
+        LOGI("il2cpp api 长时间未就绪, 跳过 .cs 转储与 hook (metadata/so 照常)");
     }
     // metadata 导出独立于 .cs 转储：无论 .cs 是否成功都单独尝试
     MetadataDump::Dumper metadataDumper;
