@@ -150,9 +150,9 @@ void listUnityModules() {
                     seg += info->dlpi_phdr[i].p_filesz;
                 }
             }
-            DumpLog::info("  模块[%d]: %s base=0x%" PRIxPTR " phnum=%zu 段总和=%zu",
+            DumpLog::info("  模块[%d]: %s base=0x%" PRIxPTR " phnum=%u 段总和=%zu",
                           c->count++, n, (uintptr_t) info->dlpi_addr,
-                          info->dlpi_phnum, seg);
+                          (unsigned) info->dlpi_phnum, seg);
         }
         return 0;
     }, &ctx, XDL_FULL_PATHNAME);
