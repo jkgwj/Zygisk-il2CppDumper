@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <ctime>
+#include <cstring>
+#include <pthread.h>
 #include <string>
 
 // 仅落盘的共享文件日志器（header-only，inline 变量保证进程内唯一实例）。
@@ -17,6 +19,7 @@ enum Level { kError = 0, kWarn = 1, kInfo = 2, kDebug = 3 };
 
 inline FILE *g_fp = nullptr;
 inline uint64_t g_start_ms = 0;
+inline pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 
 inline uint64_t now_ms() {
     struct timespec ts{};
@@ -25,26 +28,37 @@ inline uint64_t now_ms() {
 }
 
 inline bool init(const std::string &path) {
-    if (g_fp) return true;
+    pthread_mutex_lock(&g_lock);
+    if (g_fp) {
+        pthread_mutex_unlock(&g_lock);
+        return true;
+    }
     g_fp = fopen(path.c_str(), "w");
     if (g_fp) {
         g_start_ms = now_ms();
         // 写 BOM，便于 Windows 记事本正确显示中文日志
         fputs("\xEF\xBB\xBF", g_fp);
     }
+    pthread_mutex_unlock(&g_lock);
     return g_fp != nullptr;
 }
 
 inline void close() {
+    pthread_mutex_lock(&g_lock);
     if (g_fp) {
         fflush(g_fp);
         fclose(g_fp);
         g_fp = nullptr;
     }
+    pthread_mutex_unlock(&g_lock);
 }
 
 inline void vlog(Level level, const char *fmt, va_list ap) {
-    if (!g_fp) return;
+    pthread_mutex_lock(&g_lock);
+    if (!g_fp) {
+        pthread_mutex_unlock(&g_lock);
+        return;
+    }
     char buf[2048];
     va_list ap2;
     va_copy(ap2, ap);
@@ -56,6 +70,7 @@ inline void vlog(Level level, const char *fmt, va_list ap) {
     fprintf(g_fp, "[%6" PRIu64 ".%03" PRIu64 "][%-5s] %s\n",
             el / 1000u, el % 1000u, tag, buf);
     fflush(g_fp);
+    pthread_mutex_unlock(&g_lock);
 }
 
 inline void error(const char *fmt, ...) __attribute__((format(printf, 1, 2)));

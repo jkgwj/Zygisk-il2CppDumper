@@ -60,6 +60,8 @@ void hack_start(const char *game_data_dir) {
     metadataDumper.run(game_data_dir);
     // libil2cpp.so 导出独立，顺序在 metadata 之后
     SoDump::dump(game_data_dir);
+    // libunity.so 独立后台线程转储：自轮询等加载，失败只打日志不影响本流程
+    SoDump::dump_libunity_only(game_data_dir);
 }
 
 std::string GetLibDir(JavaVM *vms) {
